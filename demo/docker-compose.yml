@@ -1,0 +1,199 @@
+# NetFlow to Traces Demo - Full LGTM Stack
+# Includes: Loki, Grafana, Tempo, Mimir, OpenTelemetry Collector, and netflow2traces
+
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # Grafana Tempo - Distributed tracing backend
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    deploy:
+      resources:
+        limits:
+          memory: 400M
+    restart: unless-stopped
+    ports:
+      - "3200:3200"   # Tempo HTTP
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    logging: *logging
+
+  # Grafana Loki - Log aggregation system
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: [ "-config.file=/etc/loki/local-config.yaml" ]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    restart: unless-stopped
+    ports:
+      - "3100:3100"   # Loki HTTP
+    logging: *logging
+
+  # Grafana Mimir - Prometheus-compatible metrics backend (CLI-only config)
+  mimir:
+    image: grafana/mimir:latest
+    container_name: mimir
+    command:
+      # - -config.file=/etc/mimir/mimir.yaml
+      - -server.http-listen-port=9009
+      - -server.grpc-listen-port=9095
+      - -distributor.ring.instance-addr=127.0.0.1
+      - -ingester.ring.instance-addr=127.0.0.1
+      - -store-gateway.sharding-ring.instance-addr=127.0.0.1
+      - -compactor.ring.instance-addr=127.0.0.1
+      - -ruler.ring.instance-addr=127.0.0.1
+      # - -query-scheduler.instance-addr=127.0.0.1
+      - -query-frontend.instance-addr=127.0.0.1
+      - -memberlist.join=127.0.0.1
+      - -blocks-storage.backend=filesystem
+      - -blocks-storage.filesystem.dir=/tmp/mimir/fs
+      - -blocks-storage.tsdb.dir=/tmp/mimir/tsdb
+      - -querier.max-concurrent=20
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+    restart: unless-stopped
+    ports:
+      - "9009:9009"   # Mimir HTTP
+    logging: *logging
+
+  # Grafana - Visualization and observability platform
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # Grafana UI
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+      mimir:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *logging
+
+  # OpenTelemetry Collector - Telemetry pipeline
+  otel-collector:
+    image: ${COLLECTOR_CONTRIB_IMAGE:-ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.136.0}
+    container_name: otel-collector
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    restart: unless-stopped
+    command: [ "--config=/etc/otelcol-config.yml", "--config=/etc/otelcol-config-extras.yml" ]
+    user: "0:0"
+    volumes:
+      - ${HOST_FILESYSTEM:-/}:/hostfs:ro
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+      - ./otel-collector/otelcol-config.yml:/etc/otelcol-config.yml:ro
+      - ./otel-collector/otelcol-config-extras.yml:/etc/otelcol-config-extras.yml:ro
+    ports:
+      - "${OTEL_COLLECTOR_PORT_GRPC:-4317}:4317"   # OTLP gRPC
+      - "${OTEL_COLLECTOR_PORT_HTTP:-4318}:4318"   # OTLP HTTP
+    depends_on:
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    logging: *logging
+    environment:
+      - OTEL_COLLECTOR_HOST=otel-collector
+      - OTEL_COLLECTOR_PORT_GRPC=${OTEL_COLLECTOR_PORT_GRPC:-4317}
+      - OTEL_COLLECTOR_PORT_HTTP=${OTEL_COLLECTOR_PORT_HTTP:-4318}
+      - GOMEMLIMIT=160MiB
+      - FRONTEND_PROXY_ADDR=localhost:8080
+      - IMAGE_PROVIDER_HOST=localhost
+      - IMAGE_PROVIDER_PORT=8081
+      - POSTGRES_HOST=localhost
+      - POSTGRES_PORT=5432
+      - POSTGRES_PASSWORD=postgres
+
+  # NetFlow to Traces Converter - Sends directly to Tempo
+  netflow2traces:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: netflow2traces
+    environment:
+      # NetFlow listener configuration
+      - NETFLOW_LISTEN_HOST=0.0.0.0
+      - NETFLOW_LISTEN_PORT=2055
+
+      # OpenTelemetry configuration - sends directly to Tempo
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=netflow-to-traces
+      - OTEL_SERVICE_VERSION=0.1.0
+
+      # Logging configuration
+      - LOG_LEVEL=INFO
+    ports:
+      - "2055:2055/udp"  # NetFlow listener port
+    depends_on:
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  tempo_data:
+  grafana_data:
+  loki_data:
+
+networks:
+  default:
+    name: netflow-demo
+    driver: bridge
+
+# Usage:
+#   docker-compose up -d                    # Start all services
+#   docker-compose logs -f netflow2traces   # View netflow2traces logs
+#   docker-compose down                     # Stop all services
+#   docker-compose down -v                  # Stop and remove volumes
+#
+# Access services:
+#   Grafana UI:          http://localhost:3000 (admin/admin)
+#   Tempo API:           http://localhost:3200
+#   Loki API:            http://localhost:3100
+#   Mimir API:           http://localhost:9009
+#   OTEL Collector gRPC: localhost:4317
+#   OTEL Collector HTTP: localhost:4318
+#   NetFlow Listener:    localhost:2055 (UDP)
+#
+# Send test NetFlow data:
+#   python ../test_netflow_sender.py --host 127.0.0.1 --port 2055 --count 10
