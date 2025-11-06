@@ -340,29 +340,37 @@ class NetflowCollector:
                     # Extract and set span attributes
                     attributes = build_flow_attributes(flow, netflow_version)
 
-                    # Check if we have timing information to set span start/end times
-                    # Note: NetFlow timestamps are typically uptime-relative, not absolute
-                    # For now, we'll use them as-is and let the span creation time be the default
-                    # In a production system, you'd convert uptime-relative to absolute timestamps
-                    # using the NetFlow packet's SysUptime and unix_secs fields
+                    # Build span name with low cardinality (per OTEL recommendations)
+                    # Format: "ipflow {protocol} {src} → {dst}"
+                    src_addr = attributes.get("source.address", "unknown")
+                    dst_addr = attributes.get("destination.address", "unknown")
+                    protocol = attributes.get("network.protocol.name", "unknown")
 
-                    # For now, create span normally (could be enhanced with timing conversion)
-                    with self.tracer.start_as_current_span("netflow.flow") as flow_span:
+                    # Include ports only for TCP/UDP to keep cardinality manageable
+                    if protocol in ("tcp", "udp"):
+                        src_port = attributes.get("source.port", "")
+                        dst_port = attributes.get("destination.port", "")
+                        span_name = f"ipflow {protocol} {src_addr}:{src_port} → {dst_addr}:{dst_port}"
+                    else:
+                        span_name = f"ipflow {protocol} {src_addr} → {dst_addr}"
+
+                    # Create span with INTERNAL kind (flow observations are not client/server operations)
+                    with self.tracer.start_as_current_span(
+                        span_name,
+                        kind=trace.SpanKind.INTERNAL
+                    ) as flow_span:
                         flow_span.set_attributes(attributes)
-                        flow_span.set_attribute("netflow.flow.index", i)
+                        flow_span.set_attribute("flow.index", i)
 
                         self.flow_count += 1
 
                         # Log flow details at debug level
                         if logger.isEnabledFor(logging.DEBUG):
-                            src = attributes.get("source.address", "unknown")
-                            dst = attributes.get("destination.address", "unknown")
-                            proto = attributes.get("network.transport", "unknown")
-                            bytes_val = attributes.get("netflow.flow.bytes", 0)
-                            duration = attributes.get("netflow.flow.duration_ms")
+                            bytes_val = attributes.get("flow.bytes", 0)
+                            duration = attributes.get("flow.duration_ms")
                             duration_str = f", duration: {duration}ms" if duration is not None else ""
                             logger.debug(
-                                f"Flow {i}: {src} -> {dst} ({proto}) - "
+                                f"Flow {i}: {src_addr} → {dst_addr} ({protocol}) - "
                                 f"{format_bytes(bytes_val)}{duration_str}"
                             )
 

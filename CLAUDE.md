@@ -29,39 +29,52 @@ NetFlow Exporter sends UDP packets to netflow2traces, which parses them with Sca
 ### Trace Structure
 
 One trace per NetFlow export packet:
-- Root span: netflow.export
-  - Child span: netflow.process_flows
-    - Child spans: netflow.flow (one per flow record)
-    - Each flow span includes: source/destination IP, port, protocol, bytes, packets, interfaces, AS numbers, etc.
+- Root span: `netflow.export` (kind: INTERNAL)
+  - Child span: `netflow.parse_packet` (kind: INTERNAL)
+  - Child span: `netflow.process_flows` (kind: INTERNAL)
+    - Child spans: `ipflow {protocol} {src} → {dst}` (kind: INTERNAL, one per flow record)
+      - Example: `ipflow tcp 10.1.2.3:51528 → 10.9.8.7:443`
+      - Each flow span includes: source/destination IP, port, protocol, bytes, packets, interfaces, AS numbers, etc.
+
+**Span Naming Conventions:**
+- Flow spans use descriptive names with protocol and endpoints for better observability
+- Low cardinality maintained by using protocol names and addresses (not full 5-tuple in all cases)
+- Ports included only for TCP/UDP flows to manage cardinality
 
 ### Span Attributes Reference
 
 **Network Attributes (OpenTelemetry Semantic Conventions):**
 
-*Development Status (packet/flow telemetry):*
-- `source.address`, `source.port` - Flow source endpoint
-- `destination.address`, `destination.port` - Flow destination endpoint
-
-*Stable (connection-based traffic):*
+*Stable:*
+- `network.type` - Network layer type: "ipv4" or "ipv6" (auto-detected from address)
+- `network.transport` - Transport protocol name: "tcp", "udp", "sctp" (ONLY for actual transport protocols, NOT ICMP/IGMP/etc)
+- `network.interface.name` - Network interface name (formatted as "if{index}" from NetFlow interface index)
 - `client.address`, `client.port` - Inferred client endpoint (port-based heuristics)
-- `server.address`, `server.port` - Inferred server endpoint (well-known ports)
-- `network.transport` - Protocol name (tcp, udp, icmp, etc.)
-- `network.protocol.name` - Protocol name (same as transport)
-- `network.protocol.number` - IANA protocol number
-- `network.peer.address`, `network.peer.port` - Remote peer (typically destination)
+- `server.address`, `server.port` - Inferred server endpoint (well-known ports or port ≤1024)
 
-**NetFlow-Specific Attributes:**
+*Development Status (packet/flow telemetry):*
+- `source.address`, `source.port` - Flow source endpoint (always set)
+- `destination.address`, `destination.port` - Flow destination endpoint (always set)
+- `network.peer.address`, `network.peer.port` - Remote peer identification (typically destination)
+- `network.protocol.name` - Protocol name (set for ALL protocols including ICMP)
+- `network.protocol.number` - IANA protocol number
+
+**Generic Flow Attributes (flow.* namespace):**
+Custom attributes for flow telemetry, vendor-neutral:
+- `flow.bytes` - Octets in flow (ideally should be metrics per OTEL guidance)
+- `flow.packets` - Packet count in flow (ideally should be metrics per OTEL guidance)
+- `flow.first_switched` - Flow start timestamp (uptime-relative milliseconds)
+- `flow.last_switched` - Flow end timestamp (uptime-relative milliseconds)
+- `flow.duration_ms` - Flow duration in milliseconds (calculated)
+- `flow.index` - Flow record index in this export packet
+- `flow.tos` - IP Type of Service byte
+- `flow.tcp.flags` - TCP flags (for TCP flows only)
+
+**NetFlow-Specific Attributes (netflow.* namespace):**
+NetFlow protocol-specific fields:
 - `netflow.version` - NetFlow version (1, 5, 9, or 10 for IPFIX)
-- `netflow.flow.bytes` - Octets in flow
-- `netflow.flow.packets` - Packet count in flow
-- `netflow.flow.first_switched` - Flow start timestamp (uptime-relative)
-- `netflow.flow.last_switched` - Flow end timestamp (uptime-relative)
-- `netflow.flow.duration_ms` - Flow duration in milliseconds
-- `netflow.flow.index` - Flow record index in packet
-- `netflow.nexthop` - Next hop router IP
-- `netflow.interface.input`, `netflow.interface.output` - SNMP interface indices
-- `netflow.tos` - Type of Service byte
-- `netflow.tcp_flags` - TCP flags
+- `netflow.nexthop` - Next hop router IP address
+- `netflow.interface.input`, `netflow.interface.output` - SNMP interface indices (raw values)
 - `netflow.src_as`, `netflow.dst_as` - Source/destination AS numbers
 - `netflow.src_mask`, `netflow.dst_mask` - Source/destination netmask length
 
@@ -277,79 +290,121 @@ Heuristic logic infers client/server roles:
 - Both high ports or both low ports → no inference, only source/dest
 Why: Provides stable semantic conventions for better querying and compatibility.
 
-5. Custom netflow.* Attributes
-Namespace for NetFlow-specific attributes.
-Why: Distinguishes NetFlow data from standard conventions.
+5. Generic flow.* Namespace for Custom Attributes
+Vendor-neutral namespace (flow.*) for generic flow telemetry attributes.
+Examples: flow.bytes, flow.packets, flow.duration_ms, flow.tcp.flags, flow.tos
+Why: Aligns with OTEL guidance for custom attributes, works for sFlow/NetFlow/IPFIX.
 
-6. Scapy for Parsing
+6. NetFlow-Specific netflow.* Attributes
+Namespace for NetFlow protocol-specific fields.
+Examples: netflow.version, netflow.interface.input, netflow.src_as
+Why: Distinguishes NetFlow-specific metadata from generic flow data.
+
+7. Span Kind INTERNAL for Flow Observations
+All spans use SpanKind.INTERNAL (not CLIENT/SERVER).
+Why: Flow observations are passive monitoring, not active client/server operations per OTEL conventions.
+
+8. Descriptive Span Naming with Cardinality Management
+Flow spans named: "ipflow {protocol} {src}:{port} → {dst}:{port}"
+Examples: "ipflow tcp 10.1.2.3:51528 → 10.9.8.7:443" or "ipflow icmp 10.1.2.3 → 10.9.8.7"
+Why: Better observability and debugging while managing cardinality (ports only for TCP/UDP).
+
+9. Network Type Detection (Stable)
+Auto-detects and sets network.type = "ipv4" or "ipv6" from address format.
+Why: Provides stable OTEL attribute for network layer type.
+
+10. Transport Protocol Restrictions
+network.transport ONLY set for actual transport protocols: tcp (6), udp (17), sctp (132).
+NOT set for ICMP, IGMP, ESP, etc. (those only get network.protocol.name).
+Why: Follows OTEL semantic conventions strictly - transport ≠ all protocols.
+
+11. Network Interface Naming
+Maps NetFlow interface indices to network.interface.name = "if{index}".
+Why: Provides Development-status OTEL attribute for interface observation point.
+
+12. Scapy for Parsing
 Uses Scapy instead of custom binary parsing.
 Why: Automatic v9/IPFIX template caching, version detection, well-maintained.
 
-7. Automatic Field Name Normalization
+13. Automatic Field Name Normalization
 safe_get_field() tries multiple field name variations.
 Why: Handles Scapy version differences.
 
-8. Graceful Shutdown
+14. Graceful Shutdown
 Signal handlers flush spans before exit.
 Why: Prevents loss of in-flight traces.
 
-9. BatchSpanProcessor
+15. BatchSpanProcessor
 Groups spans into batches before export.
 Why: Reduces endpoint requests, better performance, production standard.
 
-10. Resource Attributes
+16. Resource Attributes
 All spans include service metadata (service.name, service.version only).
 Collector-specific attributes are on spans for better query flexibility.
 Why: Enables filtering by service, better cardinality management.
 
-11. Error Handling & Status Codes
+17. Error Handling & Status Codes
 Spans have OK/ERROR status with messages.
 Why: Identifies problematic packets for debugging.
 
-12. Version Detection Fallback
+18. Version Detection Fallback
 Defaults to v5 if version unknown.
 Why: Robustness - v5 is most common.
 
-13. UDP Only (No Retransmission)
+19. UDP Only (No Retransmission)
 Collector is UDP-only.
 Why: NetFlow standard, high-volume data tolerates loss.
 
-14. Non-Root Docker Container
+20. Non-Root Docker Container
 Runs as user netflow:1000.
 Why: Security best practice.
 
-15. Multi-Stage Docker Build
+21. Multi-Stage Docker Build
 Separates builder from runtime.
 Why: Reduces final image size.
+
+22. Bytes/Packets as Span Attributes (Not Ideal)
+flow.bytes and flow.packets are included as span attributes for correlation.
+Note: Per OTEL guidance, these should ideally be metrics (hw.network.io, hw.network.packets).
+Why: Provides immediate value while acknowledging metrics would be more scalable long-term.
 
 ---
 
 ## Span Lifecycle Example
 
-When a NetFlow v5 packet with 2 flows arrives:
+When a NetFlow v5 packet with 2 TCP flows arrives:
 
 1. _listen_loop() receives UDP data
-   Creates Trace: netflow.export
-   Sets: exporter address/port, packet size
+   Creates Trace: netflow.export (kind: INTERNAL)
+   Sets: exporter address/port, packet size, collector info
 
 2. _process_packet() parses packet
-   Adds: netflow.version=5, netflow.flow.count=2
+   Creates span: netflow.parse_packet (kind: INTERNAL)
+   Adds: netflow.version=5
+   Export span adds: netflow.flow.count=2
 
-3. _extract_flows() gets flow records
+3. _extract_flows() gets flow records via Scapy layer iteration
    _process_flows() creates spans for each:
-   
-   Span: netflow.flow (record 0)
-   - source.address, source.port
-   - destination.address, destination.port
-   - network.transport, network.protocol.number
-   - netflow.flow.bytes, netflow.flow.packets
-   - netflow.flow.index=0
 
-   Span: netflow.flow (record 1)
-   - [same structure]
+   Span: "ipflow tcp 10.1.2.3:51528 → 10.9.8.7:443" (kind: INTERNAL, record 0)
+   - source.address="10.1.2.3", source.port=51528
+   - destination.address="10.9.8.7", destination.port=443
+   - network.type="ipv4" (Stable)
+   - network.transport="tcp" (Stable, only for transport protocols)
+   - network.protocol.name="tcp", network.protocol.number=6
+   - client.address="10.1.2.3", server.address="10.9.8.7" (inferred from ports)
+   - network.peer.address="10.9.8.7"
+   - network.interface.name="if0"
+   - flow.bytes=12345, flow.packets=11 (custom namespace)
+   - flow.duration_ms=1500
+   - flow.index=0
+   - netflow.version=5, netflow.interface.input=0
 
-4. All spans batch and export to OTLP endpoint
-5. Tempo backend receives, indexes, makes queryable
+   Span: "ipflow tcp 192.168.1.10:443 → 192.168.1.20:52001" (kind: INTERNAL, record 1)
+   - [same structure, different values]
+
+4. All spans batch via BatchSpanProcessor and export to OTLP endpoint
+5. Tempo backend receives, indexes by high-cardinality attributes, makes queryable
 
 ---
 

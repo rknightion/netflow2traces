@@ -89,6 +89,48 @@ def _is_common_server_port(port: int) -> bool:
     return port in common_ports
 
 
+def _detect_network_type(address: str) -> str | None:
+    """Detect network type (ipv4 or ipv6) from address string.
+
+    Args:
+        address: IP address string.
+
+    Returns:
+        "ipv4", "ipv6", or None if cannot be determined.
+    """
+    if not address:
+        return None
+
+    # Simple heuristic: IPv6 contains colons, IPv4 contains dots
+    if ":" in address:
+        return "ipv6"
+    elif "." in address:
+        return "ipv4"
+    return None
+
+
+def _is_transport_protocol(protocol_num: int) -> bool:
+    """Check if a protocol number represents a transport protocol.
+
+    Transport protocols per OTEL conventions: TCP, UDP, SCTP, QUIC (not ICMP, IGMP, etc.)
+
+    Args:
+        protocol_num: IANA protocol number.
+
+    Returns:
+        True if it's a transport protocol.
+    """
+    # OTEL transport protocols: tcp, udp, sctp, quic, unix, pipe
+    # For network flows, we only see: tcp (6), udp (17), sctp (132)
+    # QUIC runs over UDP, so it would appear as UDP in NetFlow
+    transport_protocols = {
+        6,    # TCP
+        17,   # UDP
+        132,  # SCTP
+    }
+    return protocol_num in transport_protocols
+
+
 def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
     """Build OpenTelemetry span attributes from a NetFlow flow record.
 
@@ -116,6 +158,12 @@ def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
         attributes["source.address"] = str(src_addr)
     if dst_addr:
         attributes["destination.address"] = str(dst_addr)
+
+    # Network type detection (Stable) - detect from address format
+    if src_addr:
+        network_type = _detect_network_type(str(src_addr))
+        if network_type:
+            attributes["network.type"] = network_type
 
     # Ports
     src_port = safe_get_field(flow, "srcport", None)
@@ -170,42 +218,55 @@ def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
     if protocol is not None:
         protocol_num = int(protocol)
         protocol_name = get_protocol_name(protocol_num)
-        attributes["network.transport"] = protocol_name
+
+        # network.transport (Stable) - only for actual transport protocols
+        # Per OTEL conventions: tcp, udp, sctp, quic, unix, pipe
+        # Do NOT set for ICMP, IGMP, ESP, etc.
+        if _is_transport_protocol(protocol_num):
+            attributes["network.transport"] = protocol_name
+
+        # network.protocol.name - set for all protocols (can be transport or other)
         attributes["network.protocol.name"] = protocol_name
         attributes["network.protocol.number"] = protocol_num
 
-    # Flow metrics
+    # Flow metrics - use flow.* namespace for generic flow telemetry
+    # Per OTEL guidance, bytes/packets ideally should be metrics, but we include as attributes
     bytes_in = safe_get_field(flow, "dOctets", None) or safe_get_field(flow, "in_bytes", None)
     packets_in = safe_get_field(flow, "dPkts", None) or safe_get_field(flow, "in_pkts", None)
 
     if bytes_in is not None:
-        attributes["netflow.flow.bytes"] = int(bytes_in)
+        attributes["flow.bytes"] = int(bytes_in)
     if packets_in is not None:
-        attributes["netflow.flow.packets"] = int(packets_in)
+        attributes["flow.packets"] = int(packets_in)
 
     # Next hop router
     next_hop = safe_get_field(flow, "nexthop", None)
     if next_hop:
         attributes["netflow.nexthop"] = str(next_hop)
 
-    # Input/Output interface indices
+    # Network interface (Development status)
+    # NetFlow provides interface indices; we format as "if{index}" since we don't have name mappings
     input_iface = safe_get_field(flow, "input", None)
     output_iface = safe_get_field(flow, "output", None)
 
     if input_iface is not None:
+        # Set network.interface.name for ingress interface (Development status)
+        attributes["network.interface.name"] = f"if{int(input_iface)}"
+        # Keep NetFlow-specific index for reference
         attributes["netflow.interface.input"] = int(input_iface)
     if output_iface is not None:
+        # Keep NetFlow-specific output interface index
         attributes["netflow.interface.output"] = int(output_iface)
 
-    # Type of Service (TOS)
+    # Type of Service (TOS) - use flow.* namespace
     tos = safe_get_field(flow, "tos", None)
     if tos is not None:
-        attributes["netflow.tos"] = int(tos)
+        attributes["flow.tos"] = int(tos)
 
-    # TCP flags
+    # TCP flags - use flow.tcp.flags namespace
     tcp_flags = safe_get_field(flow, "tcp_flags", None)
     if tcp_flags is not None:
-        attributes["netflow.tcp_flags"] = int(tcp_flags)
+        attributes["flow.tcp.flags"] = int(tcp_flags)
 
     # Source/Destination AS numbers
     src_as = safe_get_field(flow, "src_as", None)
@@ -225,7 +286,7 @@ def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
     if dst_mask is not None:
         attributes["netflow.dst_mask"] = int(dst_mask)
 
-    # Flow duration and timestamps
+    # Flow duration and timestamps - use flow.* namespace
     # NetFlow v5 uses: First (start time), Last (end time) as uptime milliseconds
     # NetFlow v9/IPFIX may use: flowStartMilliseconds, flowEndMilliseconds
     first_switched = safe_get_field(flow, "First", None) or safe_get_field(
@@ -236,15 +297,15 @@ def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
     ) or safe_get_field(flow, "flowEndMilliseconds", None)
 
     if first_switched is not None:
-        attributes["netflow.flow.first_switched"] = int(first_switched)
+        attributes["flow.first_switched"] = int(first_switched)
     if last_switched is not None:
-        attributes["netflow.flow.last_switched"] = int(last_switched)
+        attributes["flow.last_switched"] = int(last_switched)
 
     # Calculate duration if both timestamps are available
     if first_switched is not None and last_switched is not None:
         duration_ms = int(last_switched) - int(first_switched)
         if duration_ms >= 0:  # Sanity check
-            attributes["netflow.flow.duration_ms"] = duration_ms
+            attributes["flow.duration_ms"] = duration_ms
 
     return attributes
 
