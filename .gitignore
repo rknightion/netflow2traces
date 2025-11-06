@@ -5,7 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+demo/tempo-data
 # Distribution / packaging
 .Python
 build/
