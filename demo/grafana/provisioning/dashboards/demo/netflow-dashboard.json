@@ -80,7 +80,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "Mimir"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -161,7 +161,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "rate(calls_total{service_name=\"netflow-to-traces\", span_name=\"netflow.flow\"}[5m])",
           "refId": "A"
@@ -173,7 +173,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "Mimir"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -222,7 +222,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "sum(calls_total{service_name=\"netflow-to-traces\", span_name=\"netflow.export\"})",
           "refId": "A"
@@ -234,7 +234,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "Mimir"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -283,7 +283,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "sum(calls_total{service_name=\"netflow-to-traces\", span_name=\"netflow.flow\"})",
           "refId": "A"
@@ -295,7 +295,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "Mimir"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -343,7 +343,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "sum by (network_transport) (calls_total{service_name=\"netflow-to-traces\", span_name=\"netflow.flow\"})",
           "refId": "A"
@@ -355,7 +355,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "Mimir"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -430,7 +430,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "topk(10, sum by (source_address) (calls_total{service_name=\"netflow-to-traces\", span_name=\"netflow.flow\"}))",
           "refId": "A"
@@ -442,7 +442,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "Mimir"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -517,7 +517,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "topk(10, sum by (destination_address) (calls_total{service_name=\"netflow-to-traces\", span_name=\"netflow.flow\"}))",
           "refId": "A"
@@ -557,7 +557,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "Mimir"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -637,7 +637,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.95, sum(rate(duration_bucket{service_name=\"netflow-to-traces\", span_name=\"netflow.flow\"}[5m])) by (le))",
           "legendFormat": "p95",
@@ -646,7 +646,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "Mimir"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.50, sum(rate(duration_bucket{service_name=\"netflow-to-traces\", span_name=\"netflow.flow\"}[5m])) by (le))",
           "legendFormat": "p50",

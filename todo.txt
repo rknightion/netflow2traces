@@ -15,9 +15,9 @@
 
 ## Docker & Deployment
 [x] Create Dockerfile with multi-stage build
-[x] Create docker-compose.yml with Tempo and Mimir
+[x] Create docker-compose.yml with Tempo and Prometheus
 [x] Create tempo.yaml configuration
-[x] Create mimir.yaml configuration
+[x] Create prometheus.yaml configuration
 [x] Create .dockerignore file
 
 ## Documentation & Configuration
@@ -29,20 +29,10 @@
 [x] Verify application starts and listens correctly
 [x] Create test script (test_netflow_sender.py) for manual testing
 
-## Next Steps (for user)
-[ ] Start services: docker-compose up -d
-[ ] Run application: source .venv/bin/activate && python -m netflow2traces
-[ ] Send test data: python test_netflow_sender.py
-[ ] Query traces via Tempo API at http://localhost:3200/api/search
-[ ] View metrics in Mimir at http://localhost:9009
-[ ] Test with different NetFlow versions (v5, v9, IPFIX)
-[ ] Configure real NetFlow exporters to send to port 2055
-[ ] Optional: Add Grafana to visualize traces and metrics
-
 ## Potential Enhancements
-[ ] Fix collector shutdown so the listen loop exits cleanly after `stop()` closes the socket; currently `self.sock` becomes `None` and the loop raises repeated attribute errors (src/netflow2traces/collector.py:86,270-276)
-[ ] Integrate `NetflowSession` template caching in `_parse_netflow` so v9/IPFIX templates persist across packets instead of being re-parsed ad hoc (src/netflow2traces/collector.py:42-165)
-[ ] Add a dedicated `netflow.parse_packet` span to capture parsing latency and align runtime telemetry with the README trace diagram (src/netflow2traces/collector.py:140-167)
+[x] Fix collector shutdown so the listen loop exits cleanly after `stop()` closes the socket; currently `self.sock` becomes `None` and the loop raises repeated attribute errors (src/netflow2traces/collector.py:86,270-276)
+[x] Integrate `NetflowSession` template caching in `_parse_netflow` so v9/IPFIX templates persist across packets instead of being re-parsed ad hoc (src/netflow2traces/collector.py:42-165)
+[x] Add a dedicated `netflow.parse_packet` span to capture parsing latency and align runtime telemetry with the README trace diagram (src/netflow2traces/collector.py:140-167)
 [ ] Expose ingestion health metrics (packets, flows, errors per second) via OpenTelemetry metrics or Prometheus so operators can alert on drop conditions (collector/tracer modules)
 [ ] Allow configuring OTLP auth headers/TLS options for exporters that require tokens (e.g., Grafana Cloud) instead of only supporting plain endpoint URLs (src/netflow2traces/tracer.py:70-109)
 [ ] Provide configurable flow sampling/filtering to tame cardinality before spans are created (src/netflow2traces/config.py:22-74, src/netflow2traces/collector.py:246-268)
@@ -52,5 +42,5 @@
 - One trace per export packet, flow records as child spans
 - Configurable OTLP protocol (gRPC or HTTP)
 - Python 3.14 with uv package management
-- Docker setup uses Grafana Tempo for traces and Mimir for metrics
-- Tempo metrics generator sends span metrics to Mimir
+- Docker setup uses Grafana Tempo for traces and Prometheus for metrics
+- Tempo metrics generator sends span metrics to Prometheus via remote write

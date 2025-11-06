@@ -1,6 +1,6 @@
-# NetFlow to Traces Demo - Full LGTM Stack
+# NetFlow to Traces Demo - Full LGTP Stack
 
-This demo provides a complete observability stack for NetFlow monitoring with Loki, Grafana, Tempo, and Mimir (LGTM). It showcases how NetFlow data can be converted to OpenTelemetry traces and visualized alongside metrics and logs.
+This demo provides a complete observability stack for NetFlow monitoring with Loki, Grafana, Tempo, and Prometheus (LGTP). It showcases how NetFlow data can be converted to OpenTelemetry traces and visualized alongside metrics and logs.
 
 ## Architecture
 
@@ -21,14 +21,14 @@ This demo provides a complete observability stack for NetFlow monitoring with Lo
 │                 │ • Stores traces locally
 │                 │ • Generates span metrics
 └────────┬────────┘
-         │ Metrics → http://mimir:9009/otlp
+         │ Metrics → http://prometheus:9090/api/v1/write
          ▼
 ┌─────────────────────────────────────────┐
 │         Observability Stack             │
-│  ┌──────────┐  ┌──────┐  ┌──────────┐  │
-│  │  Mimir   │  │ Loki │  │ Grafana  │  │
-│  │ (Metrics)│  │(Logs)│  │   (UI)   │  │
-│  └──────────┘  └──────┘  └──────────┘  │
+│  ┌────────────┐  ┌──────┐  ┌──────────┐ │
+│  │ Prometheus │  │ Loki │  │ Grafana  │ │
+│  │  (Metrics) │  │(Logs)│  │   (UI)   │ │
+│  └────────────┘  └──────┘  └──────────┘ │
 └─────────────────────────────────────────┘
 ```
 
@@ -36,7 +36,7 @@ This demo provides a complete observability stack for NetFlow monitoring with Lo
 
 - **netflow2traces**: Listens for NetFlow packets and converts them to OpenTelemetry traces
 - **Tempo**: Distributed tracing backend that stores traces and generates span metrics
-- **Mimir**: Prometheus-compatible metrics storage for span metrics and service graphs
+- **Prometheus**: Time-series database receiving span metrics via remote write
 - **Loki**: Log aggregation system for application logs
 - **Grafana**: Unified observability UI with pre-configured dashboards
 - **OpenTelemetry Collector**: Telemetry pipeline for processing and routing observability data
@@ -60,18 +60,13 @@ This will start all services:
 - Grafana UI: http://localhost:3000
 - Tempo API: http://localhost:3200
 - Loki API: http://localhost:3100
-- Mimir API: http://localhost:9009
+- Prometheus UI/API: http://localhost:9090
 - OTEL Collector: localhost:4317 (gRPC), localhost:4318 (HTTP)
 - NetFlow Listener: localhost:2055 (UDP)
 
 ### 2. Access Grafana
 
-Open http://localhost:3000 in your browser.
-
-- **Username**: `admin`
-- **Password**: `admin`
-
-The dashboards are pre-configured and will appear in the "Demo" folder.
+Open http://localhost:3000 in your browser. The demo enables anonymous admin access, so you should land directly on the Grafana home page with the pre-configured dashboards under the "Demo" folder.
 
 ### 3. Send Test NetFlow Data
 
@@ -184,8 +179,8 @@ nflow-generator -t 127.0.0.1 -p 2055 -v 5 -c 100
 2. **Trace Creation**: Each NetFlow export packet becomes an OTLP trace with child spans for each flow record
 3. **Direct to Tempo**: Traces are sent directly to Tempo via gRPC (port 4317)
 4. **Metrics Generation**: Tempo's metrics generator creates span metrics (RED metrics, service graphs)
-5. **Metrics to Mimir**: Span metrics are sent to Mimir via OTLP (port 9009)
-6. **Visualization**: Grafana queries Tempo for traces and Mimir for metrics
+5. **Metrics to Prometheus**: Span metrics flow to Prometheus via remote write
+6. **Visualization**: Grafana queries Tempo for traces and Prometheus for metrics
 
 ### Trace Structure
 
@@ -245,7 +240,7 @@ The following configurations can be customized:
 
 - **Tempo**: `tempo/tempo.yaml` - Adjust trace retention, metrics generator settings
 - **Loki**: `loki/loki-config.yaml` - Configure log retention, ingestion limits
-- **Mimir**: Configured via CLI flags in `docker-compose.yml` - Adjust memory limits, storage
+- **Prometheus**: `prometheus.yaml` - Adjust scrape targets or retention options
 - **Grafana**: `grafana/grafana.ini` - Change admin password, plugins, UI settings
 - **OTEL Collector**: `otel-collector/otelcol-config.yml` - Add receivers, processors, exporters
 - **Datasources**: `grafana/provisioning/datasources/datasources.yaml` - Modify correlations
@@ -263,10 +258,10 @@ The following configurations can be customized:
    { span.network.transport="tcp" }
    ```
 
-### Explore Mimir (Metrics)
+### Explore Prometheus (Metrics)
 
 1. Navigate to **Explore** in Grafana
-2. Select **Mimir** datasource
+2. Select **Prometheus** datasource
 3. Use PromQL queries:
    ```
    rate(calls_total{service_name="netflow-to-traces"}[5m])
@@ -373,14 +368,14 @@ docker-compose logs -f tempo
 ## Performance Considerations
 
 - **High Volume Deployments**: For >1000 flows/sec, consider:
-  - Increasing memory limits on Tempo and Mimir
+  - Increasing memory limits on Tempo and Prometheus
   - Reducing trace retention (currently 1 hour)
   - Using external storage backends (S3, GCS)
   - Sampling traces
 
 - **Resource Usage**: Default limits:
   - Tempo: 400MB
-  - Mimir: 300MB
+  - Prometheus: 300MB
   - Grafana: 300MB
   - Loki: 200MB
   - OTEL Collector: 200MB
@@ -388,7 +383,7 @@ docker-compose logs -f tempo
 ## References
 
 - [Grafana Tempo Documentation](https://grafana.com/docs/tempo/latest/)
-- [Grafana Mimir Documentation](https://grafana.com/docs/mimir/latest/)
+- [Prometheus Documentation](https://prometheus.io/docs/introduction/overview/)
 - [Grafana Loki Documentation](https://grafana.com/docs/loki/latest/)
 - [OpenTelemetry Collector Documentation](https://opentelemetry.io/docs/collector/)
 - [NetFlow v5 Specification](https://www.cisco.com/c/en/us/td/docs/net_mgmt/netflow_collection_engine/3-6/user/guide/format.html)

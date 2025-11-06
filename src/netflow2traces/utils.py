@@ -57,6 +57,38 @@ def safe_get_field(flow: Any, field_name: str, default: Any = None) -> Any:
         return default
 
 
+def _is_common_server_port(port: int) -> bool:
+    """Check if a port number is a common server port.
+
+    Args:
+        port: Port number to check.
+
+    Returns:
+        True if the port is a common server port.
+    """
+    # Common server ports (HTTP, HTTPS, SSH, DB, etc.)
+    common_ports = {
+        20, 21,      # FTP
+        22,          # SSH
+        23,          # Telnet
+        25,          # SMTP
+        53,          # DNS
+        80,          # HTTP
+        110,         # POP3
+        143,         # IMAP
+        443,         # HTTPS
+        445,         # SMB
+        3306,        # MySQL
+        5432,        # PostgreSQL
+        6379,        # Redis
+        8080,        # HTTP alternate
+        8443,        # HTTPS alternate
+        9090,        # Prometheus
+        27017,       # MongoDB
+    }
+    return port in common_ports
+
+
 def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
     """Build OpenTelemetry span attributes from a NetFlow flow record.
 
@@ -79,6 +111,7 @@ def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
     src_addr = safe_get_field(flow, "src", None) or safe_get_field(flow, "srcaddr", None)
     dst_addr = safe_get_field(flow, "dst", None) or safe_get_field(flow, "dstaddr", None)
 
+    # Always set source/destination (for packet-based flows)
     if src_addr:
         attributes["source.address"] = str(src_addr)
     if dst_addr:
@@ -93,11 +126,52 @@ def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
     if dst_port:
         attributes["destination.port"] = int(dst_port)
 
+    # Infer client/server from ports (well-known ports <= 1024 are typically servers)
+    # This follows OTEL stable semantic conventions for connection-based traffic
+    if src_port is not None and dst_port is not None:
+        src_port_int = int(src_port)
+        dst_port_int = int(dst_port)
+
+        # Heuristic: Well-known port (<=1024) or common service ports are servers
+        if dst_port_int <= 1024 and src_port_int > 1024:
+            # Typical client -> server pattern
+            if src_addr:
+                attributes["client.address"] = str(src_addr)
+            attributes["client.port"] = src_port_int
+            if dst_addr:
+                attributes["server.address"] = str(dst_addr)
+            attributes["server.port"] = dst_port_int
+        elif src_port_int <= 1024 and dst_port_int > 1024:
+            # Server -> client (response traffic)
+            if src_addr:
+                attributes["server.address"] = str(src_addr)
+            attributes["server.port"] = src_port_int
+            if dst_addr:
+                attributes["client.address"] = str(dst_addr)
+            attributes["client.port"] = dst_port_int
+        elif _is_common_server_port(dst_port_int) and not _is_common_server_port(src_port_int):
+            # Common server port heuristic (e.g., 80, 443, 3306, 5432)
+            if src_addr:
+                attributes["client.address"] = str(src_addr)
+            attributes["client.port"] = src_port_int
+            if dst_addr:
+                attributes["server.address"] = str(dst_addr)
+            attributes["server.port"] = dst_port_int
+        # If both are high ports or both are low ports, don't infer client/server
+
+    # Network peer attributes (destination is typically the remote peer)
+    if dst_addr:
+        attributes["network.peer.address"] = str(dst_addr)
+    if dst_port:
+        attributes["network.peer.port"] = int(dst_port)
+
     # Protocol
     protocol = safe_get_field(flow, "prot", None)
     if protocol is not None:
         protocol_num = int(protocol)
-        attributes["network.transport"] = get_protocol_name(protocol_num)
+        protocol_name = get_protocol_name(protocol_num)
+        attributes["network.transport"] = protocol_name
+        attributes["network.protocol.name"] = protocol_name
         attributes["network.protocol.number"] = protocol_num
 
     # Flow metrics
@@ -150,6 +224,27 @@ def build_flow_attributes(flow: Any, netflow_version: int) -> dict[str, Any]:
         attributes["netflow.src_mask"] = int(src_mask)
     if dst_mask is not None:
         attributes["netflow.dst_mask"] = int(dst_mask)
+
+    # Flow duration and timestamps
+    # NetFlow v5 uses: First (start time), Last (end time) as uptime milliseconds
+    # NetFlow v9/IPFIX may use: flowStartMilliseconds, flowEndMilliseconds
+    first_switched = safe_get_field(flow, "First", None) or safe_get_field(
+        flow, "first_switched", None
+    ) or safe_get_field(flow, "flowStartMilliseconds", None)
+    last_switched = safe_get_field(flow, "Last", None) or safe_get_field(
+        flow, "last_switched", None
+    ) or safe_get_field(flow, "flowEndMilliseconds", None)
+
+    if first_switched is not None:
+        attributes["netflow.flow.first_switched"] = int(first_switched)
+    if last_switched is not None:
+        attributes["netflow.flow.last_switched"] = int(last_switched)
+
+    # Calculate duration if both timestamps are available
+    if first_switched is not None and last_switched is not None:
+        duration_ms = int(last_switched) - int(first_switched)
+        if duration_ms >= 0:  # Sanity check
+            attributes["netflow.flow.duration_ms"] = duration_ms
 
     return attributes
 

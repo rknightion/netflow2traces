@@ -19,12 +19,12 @@ NetFlow Exporter (Router/Switch)
          ▼
   netflow2traces (this app)
          │ Parses with Scapy
-         │ Creates OTEL traces
-         ▼
-  OTLP Exporter (gRPC/HTTP)
-         ▼
-  OTLP Collector / Backend
-  (Jaeger, Tempo, Grafana Cloud)
+         │ Creates OTEL traces & metrics
+         ├─────────────┬─────────────┐
+         ▼             ▼             ▼
+   Tempo (traces)  Prometheus   Grafana Cloud
+    via OTLP       (metrics)      (all signals)
+                   via OTLP
 ```
 
 ### Trace Structure
@@ -47,11 +47,13 @@ Trace: netflow.export
 
 - **Multi-version NetFlow support**: v1, v5, v9, IPFIX (v10)
 - **Automatic template handling**: Scapy manages v9/IPFIX template caching
-- **Configurable OTLP export**: gRPC or HTTP protocols
+- **Dual telemetry export**: Both traces and metrics via OTLP
+- **Signal-specific endpoints**: Configure separate endpoints for traces and metrics
+- **Configurable OTLP protocols**: gRPC or HTTP for each signal type
 - **Semantic conventions**: Follows OpenTelemetry network conventions
 - **Comprehensive logging**: DEBUG/INFO/WARNING/ERROR levels
-- **Docker support**: Ready-to-run container with Tempo and Mimir for testing
-- **Graceful shutdown**: Properly flushes pending spans on SIGTERM/SIGINT
+- **Docker support**: Ready-to-run demo with Tempo, Prometheus, and Grafana
+- **Graceful shutdown**: Properly flushes pending spans and metrics on SIGTERM/SIGINT
 
 ## Requirements
 
@@ -97,19 +99,47 @@ cp .env.example .env
 
 ### Environment Variables
 
+#### Base Configuration
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `NETFLOW_LISTEN_HOST` | No | `0.0.0.0` | Host to bind UDP listener |
 | `NETFLOW_LISTEN_PORT` | No | `2055` | UDP port for NetFlow packets |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | **Yes** | - | OTLP collector endpoint |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | No | `grpc` | Protocol: `grpc` or `http` |
-| `OTEL_SERVICE_NAME` | No | `netflow-to-traces` | Service name in traces |
-| `OTEL_SERVICE_VERSION` | No | `0.1.0` | Service version in traces |
+| `OTEL_SERVICE_NAME` | No | `netflow-to-traces` | Service name in telemetry |
+| `OTEL_SERVICE_VERSION` | No | `0.1.0` | Service version in telemetry |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
+
+#### OTLP Configuration (Option 1: Single Endpoint)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | **Yes*** | - | Base OTLP endpoint for all signals |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | No | `grpc` | Base protocol: `grpc` or `http` |
+
+#### OTLP Configuration (Option 2: Signal-Specific - Takes Precedence)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | No | - | Traces endpoint (e.g., Tempo) |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | No | - | Traces protocol: `grpc` or `http` |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | No | - | Metrics endpoint (e.g., Prometheus) |
+| `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | No | - | Metrics protocol: `grpc` or `http` |
+
+*Required unless signal-specific endpoints are provided
 
 ### Example Configurations
 
-#### Local Development with Tempo
+#### Docker Demo (Signal-Specific - Recommended)
+
+```bash
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4317
+export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://prometheus:9090/api/v1/otlp/v1/metrics
+export OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http
+export LOG_LEVEL=INFO
+```
+
+#### Local Development (Single Endpoint)
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
@@ -117,7 +147,7 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 export LOG_LEVEL=DEBUG
 ```
 
-#### Grafana Cloud
+#### Grafana Cloud (Single Endpoint)
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-us-central-0.grafana.net/otlp
@@ -143,7 +173,7 @@ python -m netflow2traces
 ### Running with Docker Compose
 
 ```bash
-# Start netflow2traces, Tempo, and Mimir
+# Start netflow2traces, Tempo, and Prometheus
 docker-compose up -d
 
 # View logs
@@ -165,63 +195,118 @@ netflow2traces
 
 ## Testing
 
-### Generate Test NetFlow Data
+This project includes comprehensive testing tools for generating NetFlow data. See [tools/README.md](tools/README.md) for detailed documentation.
 
-#### Using softflowd
+### Quick Start
+
+```bash
+# Start the demo environment
+cd demo/
+docker-compose up -d
+
+# Send test NetFlow v5 packets
+python tools/netflow_generator.py --count 10 --pattern http
+
+# View results in logs
+docker-compose logs -f netflow2traces
+
+# Open Grafana to explore traces
+open http://localhost:3000
+```
+
+### Testing Tools
+
+#### 1. Enhanced Python Generator (Recommended)
+
+The `tools/netflow_generator.py` script supports NetFlow v5, v9, and IPFIX with multiple traffic patterns:
+
+```bash
+# HTTP traffic simulation
+python tools/netflow_generator.py --version 5 --pattern http --count 10
+
+# Mixed traffic with high volume
+python tools/netflow_generator.py --pattern mixed --flows 10 --rate 5 --count 100
+
+# DNS-heavy traffic
+python tools/netflow_generator.py --pattern dns --count 50 --rate 10
+
+# Custom destination
+python tools/netflow_generator.py --host 192.168.1.100 --port 9999
+```
+
+**Traffic Patterns**: `http`, `https`, `dns`, `ssh`, `mixed`
+
+**Key Options**:
+- `--version 5|9|10` - NetFlow version (v10 = IPFIX)
+- `--pattern` - Traffic type
+- `--count` - Number of packets
+- `--flows` - Flows per packet (1-30)
+- `--rate` - Packets per second
+
+#### 2. Docker Traffic Generator (For Demos)
+
+Start continuous traffic generation with the demo profile:
+
+```bash
+cd demo/
+
+# Start with traffic generator
+docker-compose --profile demo up -d
+
+# View generator logs
+docker-compose logs -f netflow-generator
+
+# Stop generator
+docker-compose stop netflow-generator
+```
+
+The Docker generator automatically sends diverse NetFlow v5 traffic for dashboard demos.
+
+#### 3. Legacy Test Script
+
+The original simple test script is still available:
+
+```bash
+python test_netflow_sender.py --host 127.0.0.1 --port 2055 --count 10
+```
+
+### Additional Testing Options
+
+#### Using softflowd (Real Traffic)
 
 ```bash
 # Install softflowd (example for Ubuntu)
 sudo apt-get install softflowd
 
-# Generate NetFlow v9 data from an interface
+# Generate NetFlow v9 from network interface
 sudo softflowd -i eth0 -n 127.0.0.1:2055 -v 9
+
+# Or from PCAP file
+sudo softflowd -r traffic.pcap -n 127.0.0.1:2055 -v 9
 ```
 
-#### Using nflow-generator
-
-```bash
-# Install nflow-generator
-npm install -g nflow-generator
-
-# Generate sample NetFlow v5 data
-nflow-generator -t 127.0.0.1 -p 2055 -v 5
-```
-
-#### Using Python Scapy
+#### Using Python Scapy Directly
 
 ```python
 from scapy.all import *
 from scapy.layers.netflow import *
 
-# Create a simple NetFlow v5 packet
-nf = NetflowHeaderV5(
-    version=5,
-    count=1,
-    sysUptime=1000,
-    unixSecs=int(time.time()),
-    unixNanoSeconds=0,
-    flowSequence=1
-)
-
-flow = NetflowRecordV5(
-    src="192.168.1.100",
-    dst="10.0.0.50",
-    srcport=443,
-    dstport=52341,
-    prot=6,  # TCP
-    dPkts=100,
-    dOctets=150000
-)
+# Create a NetFlow v5 packet
+nf = NetflowHeaderV5(version=5, count=1, sysUptime=1000,
+                     unixSecs=int(time.time()), flowSequence=1)
+flow = NetflowRecordV5(src="192.168.1.100", dst="10.0.0.50",
+                      srcport=443, dstport=52341, prot=6,
+                      dPkts=100, dOctets=150000)
 
 # Send to collector
 send(IP(dst="127.0.0.1")/UDP(dport=2055)/(nf/flow))
 ```
 
-## Viewing Traces
+## Viewing Telemetry
 
-### Tempo (Local)
+### Traces (Tempo)
 
-1. Start services: `docker-compose up -d`
+1. Start services: `cd demo && docker-compose up -d`
 2. Access Tempo API: http://localhost:3200
 3. Query traces using the Tempo API:
    ```bash
@@ -231,14 +316,36 @@ send(IP(dst="127.0.0.1")/UDP(dport=2055)/(nf/flow))
    # Get a specific trace (replace TRACE_ID)
    curl http://localhost:3200/api/traces/TRACE_ID
    ```
-4. Tempo metrics are pushed to Mimir at http://localhost:9009
-5. For visualization, connect Grafana to Tempo and Mimir data sources
+4. View in Grafana: http://localhost:3000 → Explore → Tempo
+
+### Metrics (Prometheus)
+
+1. Access Prometheus UI: http://localhost:9090
+2. Query collector metrics:
+   ```promql
+   # Total packets processed
+   netflow_packets_total
+
+   # Total flows processed
+   netflow_flows_total
+
+   # Packet size distribution
+   netflow_packet_size_bytes_bucket
+
+   # Flows per packet distribution
+   netflow_flows_per_packet_bucket
+
+   # Error rate
+   rate(netflow_packet_errors_total[5m])
+   ```
+3. View in Grafana: http://localhost:3000 → Explore → Prometheus
 
 ### Grafana Cloud
 
-1. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` with your Grafana Cloud endpoint
-2. Navigate to Grafana → Explore → Tempo
-3. Query by service name: `netflow-to-traces`
+1. Configure signal-specific endpoints or single endpoint for Grafana Cloud
+2. Navigate to Grafana → Explore
+3. Select Tempo or Prometheus data source
+4. Query by service name: `netflow-to-traces`
 
 ## Span Attributes
 
@@ -370,13 +477,19 @@ netflow2traces/
 │   ├── tracer.py         # OpenTelemetry setup
 │   ├── collector.py      # NetFlow listener and parser
 │   └── utils.py          # Protocol mappings and helpers
+├── tools/
+│   ├── netflow_generator.py  # Enhanced test data generator
+│   └── README.md             # Testing tools documentation
+├── demo/
+│   ├── docker-compose.yml    # Full LGTM stack with generator
+│   ├── tempo/                # Tempo configuration
+│   ├── loki/                 # Loki configuration
+│   └── grafana/              # Grafana dashboards and datasources
 ├── pyproject.toml        # Project metadata and dependencies
+├── uv.lock               # Locked dependencies
 ├── Dockerfile            # Multi-stage Docker build
-├── docker-compose.yml    # Docker Compose with Tempo and Mimir
-├── tempo.yaml            # Tempo configuration
-├── mimir.yaml            # Mimir configuration
 ├── .env.example          # Example configuration
-├── .dockerignore         # Docker build exclusions
+├── test_netflow_sender.py # Legacy test script
 ├── todo.txt              # Task tracking
 └── README.md             # This file
 ```

@@ -9,6 +9,7 @@ import sys
 
 from .collector import NetflowCollector
 from .config import Config
+from .metrics import CollectorMetrics, MetricsManager
 from .tracer import TracerManager
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,8 @@ logger = logging.getLogger(__name__)
 # Global references for signal handling
 collector: NetflowCollector | None = None
 tracer_manager: TracerManager | None = None
+metrics_manager: MetricsManager | None = None
+collector_metrics: CollectorMetrics | None = None
 
 
 def signal_handler(signum: int, frame: any) -> None:
@@ -36,6 +39,9 @@ def signal_handler(signum: int, frame: any) -> None:
     if tracer_manager:
         tracer_manager.shutdown()
 
+    if metrics_manager:
+        metrics_manager.shutdown()
+
     logger.info("Shutdown complete")
     sys.exit(0)
 
@@ -46,7 +52,7 @@ def main() -> int:
     Returns:
         Exit code (0 for success, non-zero for error).
     """
-    global collector, tracer_manager
+    global collector, tracer_manager, metrics_manager, collector_metrics
 
     try:
         # Load configuration from environment
@@ -62,12 +68,15 @@ def main() -> int:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        # Initialize OpenTelemetry tracer
+        # Initialize OpenTelemetry tracer and metrics
         tracer_manager = TracerManager(config)
         tracer = tracer_manager.setup()
 
+        metrics_manager = MetricsManager(config)
+        collector_metrics = metrics_manager.setup()
+
         # Initialize and start NetFlow collector
-        collector = NetflowCollector(config, tracer)
+        collector = NetflowCollector(config, tracer, collector_metrics)
         collector.start()
 
         return 0
@@ -96,6 +105,8 @@ def main() -> int:
             collector.stop()
         if tracer_manager:
             tracer_manager.shutdown()
+        if metrics_manager:
+            metrics_manager.shutdown()
         return 0
 
     except Exception as e:

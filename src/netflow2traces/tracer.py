@@ -48,24 +48,18 @@ class TracerManager:
         logger.info("Initializing OpenTelemetry tracer...")
 
         # Create resource with service attributes
-        resource = Resource.create(
-            {
-                "service.name": self.config.otel_service_name,
-                "service.version": self.config.otel_service_version,
-                "netflow.collector.host": self.config.netflow_listen_host,
-                "netflow.collector.port": self.config.netflow_listen_port,
-                "netflow.collector.protocol": "udp",
-            }
-        )
+        resource = Resource.create(self.config.resource_attributes())
 
         # Initialize tracer provider
         self.tracer_provider = TracerProvider(resource=resource)
         trace.set_tracer_provider(self.tracer_provider)
 
         # Create appropriate exporter based on protocol
-        exporter = self._create_exporter(
-            self.config.otel_exporter_endpoint, self.config.otel_exporter_protocol
-        )
+        # Use signal-specific traces endpoint/protocol with fallback to base
+        traces_endpoint = self.config.get_traces_endpoint()
+        traces_protocol = self.config.get_traces_protocol()
+
+        exporter = self._create_exporter(traces_endpoint, traces_protocol)
 
         # Add batch span processor
         span_processor = BatchSpanProcessor(exporter)
@@ -78,8 +72,8 @@ class TracerManager:
         atexit.register(self.shutdown)
 
         logger.info(
-            f"OpenTelemetry tracer initialized with {self.config.otel_exporter_protocol.upper()} "
-            f"exporter to {self.config.otel_exporter_endpoint}"
+            f"OpenTelemetry tracer initialized with {traces_protocol.upper()} "
+            f"exporter to {traces_endpoint}"
         )
 
         return self.tracer

@@ -11,9 +11,10 @@ from typing import Any
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from scapy.all import NetflowHeader, NetflowHeaderV5, NetflowHeaderV9
-from scapy.layers.netflow import NetflowSession, netflowv9_defragment
+from scapy.layers.netflow import NetflowSession
 
 from .config import Config
+from .metrics import CollectorMetrics
 from .utils import build_flow_attributes, format_bytes
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,9 @@ logger = logging.getLogger(__name__)
 class NetflowCollector:
     """Collects NetFlow packets and converts them to OpenTelemetry traces."""
 
-    def __init__(self, config: Config, tracer: trace.Tracer):
+    def __init__(
+        self, config: Config, tracer: trace.Tracer, metrics: CollectorMetrics | None = None
+    ):
         """Initialize the NetFlow collector.
 
         Args:
@@ -31,8 +34,10 @@ class NetflowCollector:
         """
         self.config = config
         self.tracer = tracer
+        self.metrics = metrics
         self.sock: socket.socket | None = None
         self.session = NetflowSession()
+        self.running = False
         self.packet_count = 0
         self.flow_count = 0
         self.error_count = 0
@@ -60,13 +65,20 @@ class NetflowCollector:
 
     def _listen_loop(self) -> None:
         """Main listening loop for NetFlow packets."""
+        self.running = True
         logger.info("NetFlow collector started. Waiting for packets...")
 
-        while True:
+        while self.running:
             try:
+                # Safety check for socket closure during shutdown
+                if self.sock is None:
+                    break
+
                 # Receive UDP packet
                 data, addr = self.sock.recvfrom(65535)  # Max UDP packet size
                 self.packet_count += 1
+                if self.metrics:
+                    self.metrics.record_packet(len(data))
 
                 logger.debug(
                     f"Received {len(data)} bytes from {addr[0]}:{addr[1]} "
@@ -81,6 +93,8 @@ class NetflowCollector:
                 break
             except Exception as e:
                 self.error_count += 1
+                if self.metrics:
+                    self.metrics.record_error()
                 logger.error(f"Error processing packet: {e}", exc_info=True)
                 continue
 
@@ -97,21 +111,38 @@ class NetflowCollector:
         with self.tracer.start_as_current_span("netflow.export") as export_span:
             export_span.set_attributes(
                 {
+                    # Exporter information
                     "netflow.exporter.address": exporter_ip,
                     "netflow.exporter.port": exporter_port,
                     "netflow.packet.size_bytes": len(data),
+                    # Collector information (moved from resource attributes)
+                    "netflow.collector.host": self.config.netflow_listen_host,
+                    "netflow.collector.port": self.config.netflow_listen_port,
+                    "netflow.collector.protocol": "udp",
                 }
             )
 
             try:
-                # Parse with Scapy
-                parsed = self._parse_netflow(data)
-                if parsed is None:
-                    export_span.set_status(Status(StatusCode.ERROR, "Failed to parse packet"))
-                    return
+                # Add dedicated parsing span to capture parsing latency
+                with self.tracer.start_as_current_span("netflow.parse_packet") as parse_span:
+                    parse_span.set_attribute("netflow.packet.size_bytes", len(data))
 
-                # Extract NetFlow version and flow count
-                netflow_version = self._get_netflow_version(parsed)
+                    # Parse with Scapy
+                    parsed = self._parse_netflow(data)
+
+                    if parsed is None:
+                        parse_span.set_status(Status(StatusCode.ERROR, "Parse failed"))
+                        export_span.set_status(Status(StatusCode.ERROR, "Failed to parse packet"))
+                        if self.metrics:
+                            self.metrics.record_error()
+                        return
+
+                    # Extract version and record in parse span
+                    netflow_version = self._get_netflow_version(parsed)
+                    parse_span.set_attribute("netflow.version", netflow_version)
+                    parse_span.set_status(Status(StatusCode.OK))
+
+                # Extract flow records
                 flows = self._extract_flows(parsed, netflow_version)
 
                 export_span.set_attributes(
@@ -120,6 +151,9 @@ class NetflowCollector:
                         "netflow.flow.count": len(flows),
                     }
                 )
+
+                if self.metrics:
+                    self.metrics.record_flows(len(flows))
 
                 logger.info(
                     f"Parsed NetFlow v{netflow_version} packet from {exporter_ip}: "
@@ -136,6 +170,8 @@ class NetflowCollector:
                 logger.error(error_msg, exc_info=True)
                 export_span.set_status(Status(StatusCode.ERROR, error_msg))
                 export_span.record_exception(e)
+                if self.metrics:
+                    self.metrics.record_error()
 
     def _parse_netflow(self, data: bytes) -> Any | None:
         """Parse raw NetFlow packet data using Scapy.
@@ -156,13 +192,11 @@ class NetflowCollector:
             raw_pkt = Raw(data)
             netflow_pkt = NetflowHeader(data)
 
-            # For NetFlow v9/IPFIX, defragment to handle templates
+            # For NetFlow v9/IPFIX, use session to persist templates across packets
             if hasattr(netflow_pkt, "version") and netflow_pkt.version in (9, 10):
-                # Store and use session for template caching
-                defragmented = netflowv9_defragment([netflow_pkt])
-                if defragmented:
-                    return defragmented[0]
-                return netflow_pkt
+                # Process through session to cache templates and reconstruct records
+                processed = self.session.process(netflow_pkt)
+                return processed if processed else netflow_pkt
 
             return netflow_pkt
 
@@ -202,34 +236,92 @@ class NetflowCollector:
         """
         flows = []
 
-        # NetFlow v5 - records are in 'records' field
-        if version == 5 and hasattr(packet, "records"):
-            flows = packet.records
+        # Debug logging to identify packet structure
+        logger.debug(f"Extracting flows from NetFlow v{version} packet")
+        logger.debug(f"Packet type: {type(packet).__name__}")
+        logger.debug(f"Packet attributes: {[attr for attr in dir(packet) if not attr.startswith('_')]}")
+
+        # NetFlow v5 - flow records are accessible via iteration or fields
+        if version == 5:
+            # Try multiple approaches to extract NetFlow v5 records
+            # Approach 1: Check if packet is iterable (Scapy packets can be iterated)
+            try:
+                # NetFlow v5 header has a count field, and records follow
+                if hasattr(packet, "count") and hasattr(packet, "getlayer"):
+                    count = packet.count
+                    logger.debug(f"NetFlow v5 packet reports {count} flow(s)")
+
+                    # Try to get NetflowRecordV5 layers
+                    from scapy.layers.netflow import NetflowRecordV5
+                    layer = packet.getlayer(NetflowRecordV5)
+                    while layer:
+                        flows.append(layer)
+                        layer = layer.payload.getlayer(NetflowRecordV5) if layer.payload else None
+
+                    logger.debug(f"Extracted {len(flows)} flows via getlayer(NetflowRecordV5)")
+
+                # Approach 2: Check if has 'records' attribute (alternate field name)
+                elif hasattr(packet, "records"):
+                    flows = packet.records if isinstance(packet.records, list) else [packet.records]
+                    logger.debug(f"Found {len(flows)} flow(s) in 'records' field")
+
+                # Approach 3: Try iterating through packet layers
+                elif hasattr(packet, "layers"):
+                    layer_list = packet.layers()
+                    logger.debug(f"Packet has {len(layer_list)} layers: {[l.name for l in layer_list]}")
+                    for layer in layer_list:
+                        if "NetflowRecord" in layer.name:
+                            flows.append(layer)
+            except Exception as e:
+                logger.error(f"Error extracting v5 flows: {e}", exc_info=True)
+
+            if len(flows) == 0:
+                logger.warning(f"NetFlow v5 packet missing flows. Packet type: {type(packet).__name__}")
 
         # NetFlow v9/IPFIX - records are in flowsets
         elif version in (9, 10):
+            logger.debug("Processing NetFlow v9/IPFIX packet structure")
             # Walk through the packet structure to find data flowsets
             layer = packet
+            layer_count = 0
             while layer:
+                layer_count += 1
+                logger.debug(f"Layer {layer_count}: {type(layer).__name__}")
+
                 if hasattr(layer, "templates"):
                     # Skip template flowsets
+                    logger.debug("  - Has templates (skipping)")
                     pass
                 elif hasattr(layer, "records"):
                     # Data flowset with records
-                    flows.extend(layer.records if isinstance(layer.records, list) else [layer.records])
+                    records = layer.records if isinstance(layer.records, list) else [layer.records]
+                    flows.extend(records)
+                    logger.debug(f"  - Found {len(records)} record(s) in 'records' field")
                 elif hasattr(layer, "flowsets"):
                     # Process flowsets
-                    for flowset in layer.flowsets:
+                    logger.debug(f"  - Has flowsets: {len(layer.flowsets)}")
+                    for idx, flowset in enumerate(layer.flowsets):
+                        logger.debug(f"    Flowset {idx}: {type(flowset).__name__}")
                         if hasattr(flowset, "records"):
                             records = flowset.records
-                            flows.extend(records if isinstance(records, list) else [records])
+                            record_list = records if isinstance(records, list) else [records]
+                            flows.extend(record_list)
+                            logger.debug(f"      - Found {len(record_list)} record(s)")
 
                 # Move to next layer
                 layer = layer.payload if hasattr(layer, "payload") else None
 
         # NetFlow v1 - similar to v5
-        elif version == 1 and hasattr(packet, "records"):
-            flows = packet.records
+        elif version == 1:
+            if hasattr(packet, "records"):
+                flows = packet.records if isinstance(packet.records, list) else [packet.records]
+                logger.debug(f"Found {len(flows)} flow(s) in 'records' field")
+            else:
+                logger.warning(f"NetFlow v1 packet missing 'records' attribute. Available: {dir(packet)}")
+
+        logger.debug(f"Total flows extracted: {len(flows)}")
+        if len(flows) == 0:
+            logger.warning(f"No flows extracted from NetFlow v{version} packet. Packet structure may be unexpected.")
 
         return flows
 
@@ -245,9 +337,17 @@ class NetflowCollector:
 
             for i, flow in enumerate(flows):
                 try:
+                    # Extract and set span attributes
+                    attributes = build_flow_attributes(flow, netflow_version)
+
+                    # Check if we have timing information to set span start/end times
+                    # Note: NetFlow timestamps are typically uptime-relative, not absolute
+                    # For now, we'll use them as-is and let the span creation time be the default
+                    # In a production system, you'd convert uptime-relative to absolute timestamps
+                    # using the NetFlow packet's SysUptime and unix_secs fields
+
+                    # For now, create span normally (could be enhanced with timing conversion)
                     with self.tracer.start_as_current_span("netflow.flow") as flow_span:
-                        # Extract and set span attributes
-                        attributes = build_flow_attributes(flow, netflow_version)
                         flow_span.set_attributes(attributes)
                         flow_span.set_attribute("netflow.flow.index", i)
 
@@ -259,8 +359,11 @@ class NetflowCollector:
                             dst = attributes.get("destination.address", "unknown")
                             proto = attributes.get("network.transport", "unknown")
                             bytes_val = attributes.get("netflow.flow.bytes", 0)
+                            duration = attributes.get("netflow.flow.duration_ms")
+                            duration_str = f", duration: {duration}ms" if duration is not None else ""
                             logger.debug(
-                                f"Flow {i}: {src} -> {dst} ({proto}) - {format_bytes(bytes_val)}"
+                                f"Flow {i}: {src} -> {dst} ({proto}) - "
+                                f"{format_bytes(bytes_val)}{duration_str}"
                             )
 
                 except Exception as e:
@@ -269,6 +372,9 @@ class NetflowCollector:
 
     def stop(self) -> None:
         """Stop the collector and close the socket."""
+        # Signal the listen loop to stop
+        self.running = False
+
         if self.sock:
             logger.info("Closing NetFlow collector socket...")
             self.sock.close()

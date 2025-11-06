@@ -16,7 +16,7 @@
 - **NetFlow Parsing**: Scapy (with automatic v9/IPFIX template handling)
 - **Telemetry**: OpenTelemetry Python SDK with gRPC/HTTP OTLP exporters
 - **Container**: Multi-stage Docker build with Python 3.14-slim
-- **Demo Stack**: Grafana Tempo, Loki, Mimir, Grafana, OpenTelemetry Collector
+- **Demo Stack**: Grafana Tempo, Loki, Prometheus, Grafana, OpenTelemetry Collector
 
 ---
 
@@ -36,18 +36,41 @@ One trace per NetFlow export packet:
 
 ### Span Attributes Reference
 
-Network Attributes (OpenTelemetry semantic conventions):
-- source.address, source.port
-- destination.address, destination.port
-- network.transport, network.protocol.number
+**Network Attributes (OpenTelemetry Semantic Conventions):**
 
-NetFlow-Specific Attributes:
-- netflow.version, netflow.flow.bytes, netflow.flow.packets
-- netflow.nexthop, netflow.interface.input, netflow.interface.output
-- netflow.tos, netflow.tcp_flags, netflow.src_as, netflow.dst_as, etc.
+*Development Status (packet/flow telemetry):*
+- `source.address`, `source.port` - Flow source endpoint
+- `destination.address`, `destination.port` - Flow destination endpoint
 
-Export Attributes:
-- netflow.exporter.address, netflow.exporter.port, netflow.packet.size_bytes
+*Stable (connection-based traffic):*
+- `client.address`, `client.port` - Inferred client endpoint (port-based heuristics)
+- `server.address`, `server.port` - Inferred server endpoint (well-known ports)
+- `network.transport` - Protocol name (tcp, udp, icmp, etc.)
+- `network.protocol.name` - Protocol name (same as transport)
+- `network.protocol.number` - IANA protocol number
+- `network.peer.address`, `network.peer.port` - Remote peer (typically destination)
+
+**NetFlow-Specific Attributes:**
+- `netflow.version` - NetFlow version (1, 5, 9, or 10 for IPFIX)
+- `netflow.flow.bytes` - Octets in flow
+- `netflow.flow.packets` - Packet count in flow
+- `netflow.flow.first_switched` - Flow start timestamp (uptime-relative)
+- `netflow.flow.last_switched` - Flow end timestamp (uptime-relative)
+- `netflow.flow.duration_ms` - Flow duration in milliseconds
+- `netflow.flow.index` - Flow record index in packet
+- `netflow.nexthop` - Next hop router IP
+- `netflow.interface.input`, `netflow.interface.output` - SNMP interface indices
+- `netflow.tos` - Type of Service byte
+- `netflow.tcp_flags` - TCP flags
+- `netflow.src_as`, `netflow.dst_as` - Source/destination AS numbers
+- `netflow.src_mask`, `netflow.dst_mask` - Source/destination netmask length
+
+**Export Span Attributes (netflow.export):**
+- `netflow.exporter.address`, `netflow.exporter.port` - NetFlow exporter endpoint
+- `netflow.collector.host`, `netflow.collector.port`, `netflow.collector.protocol` - Collector info
+- `netflow.packet.size_bytes` - Raw UDP packet size
+- `netflow.flow.count` - Number of flows in this export
+- `netflow.version` - NetFlow version
 
 ---
 
@@ -109,7 +132,8 @@ TracerManager class:
 
 Resource attributes attached to all spans:
 - service.name, service.version
-- netflow.collector.host, netflow.collector.port, netflow.collector.protocol
+
+Note: Collector information (host, port, protocol) is set as span attributes on the root export span rather than resource attributes for better query flexibility.
 
 ### src/netflow2traces/collector.py
 UDP listener, NetFlow parsing, trace creation.
@@ -239,51 +263,62 @@ Why: Maintains causality and temporal locality. Atomic exports.
 Each flow record is a child span under netflow.process_flows.
 Why: Allows querying by individual flow attributes while maintaining packet context.
 
-3. OpenTelemetry Semantic Conventions
-Network attributes follow OTEL standard conventions.
-Why: Interoperability with standard OTEL tooling.
+3. OpenTelemetry Semantic Conventions - Dual Attribution
+Network attributes follow OTEL standard conventions with both:
+- Development status: source.*/destination.* (for packet/flow data)
+- Stable status: client.*/server.* (inferred from ports)
+- Network peer: network.peer.* (remote endpoint)
+Why: Interoperability with standard OTEL tooling and future-proofing.
 
-4. Custom netflow.* Attributes
+4. Client/Server Inference from Ports
+Heuristic logic infers client/server roles:
+- Destination port ≤ 1024 and source port > 1024 → client-to-server
+- Common server ports (80, 443, 3306, etc.) → identifies server
+- Both high ports or both low ports → no inference, only source/dest
+Why: Provides stable semantic conventions for better querying and compatibility.
+
+5. Custom netflow.* Attributes
 Namespace for NetFlow-specific attributes.
 Why: Distinguishes NetFlow data from standard conventions.
 
-5. Scapy for Parsing
+6. Scapy for Parsing
 Uses Scapy instead of custom binary parsing.
 Why: Automatic v9/IPFIX template caching, version detection, well-maintained.
 
-6. Automatic Field Name Normalization
+7. Automatic Field Name Normalization
 safe_get_field() tries multiple field name variations.
 Why: Handles Scapy version differences.
 
-7. Graceful Shutdown
+8. Graceful Shutdown
 Signal handlers flush spans before exit.
 Why: Prevents loss of in-flight traces.
 
-8. BatchSpanProcessor
+9. BatchSpanProcessor
 Groups spans into batches before export.
 Why: Reduces endpoint requests, better performance, production standard.
 
-9. Resource Attributes
-All spans include service metadata.
-Why: Enables filtering by collector instance.
+10. Resource Attributes
+All spans include service metadata (service.name, service.version only).
+Collector-specific attributes are on spans for better query flexibility.
+Why: Enables filtering by service, better cardinality management.
 
-10. Error Handling & Status Codes
+11. Error Handling & Status Codes
 Spans have OK/ERROR status with messages.
 Why: Identifies problematic packets for debugging.
 
-11. Version Detection Fallback
+12. Version Detection Fallback
 Defaults to v5 if version unknown.
 Why: Robustness - v5 is most common.
 
-12. UDP Only (No Retransmission)
+13. UDP Only (No Retransmission)
 Collector is UDP-only.
 Why: NetFlow standard, high-volume data tolerates loss.
 
-13. Non-Root Docker Container
+14. Non-Root Docker Container
 Runs as user netflow:1000.
 Why: Security best practice.
 
-14. Multi-Stage Docker Build
+15. Multi-Stage Docker Build
 Separates builder from runtime.
 Why: Reduces final image size.
 
@@ -326,7 +361,7 @@ When a NetFlow v5 packet with 2 flows arrives:
    - High-cardinality design
    - gRPC/HTTP OTLP support
    - Built-in Grafana integration
-   - Pushes metrics to Mimir
+   - Pushes metrics to Prometheus via remote write
 
 2. Jaeger - Supported
    - Older but still OTLP compatible

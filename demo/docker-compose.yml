@@ -1,5 +1,5 @@
-# NetFlow to Traces Demo - Full LGTM Stack
-# Includes: Loki, Grafana, Tempo, Mimir, OpenTelemetry Collector, and netflow2traces
+# NetFlow to Traces Demo - Full LGTP Stack
+# Includes: Loki, Grafana, Tempo, Prometheus, and netflow2traces
 
 x-logging: &logging
   driver: "json-file"
@@ -9,23 +9,43 @@ x-logging: &logging
 
 services:
   # Grafana Tempo - Distributed tracing backend
+  # Tempo runs as user 10001, and docker compose creates the volume as root.
+  # As such, we need to chown the volume in order for Tempo to start correctly.
+  init:
+    image: busybox:latest
+    user: root
+    entrypoint:
+      - "chown"
+      - "10001:10001"
+      - "/var/tempo"
+    volumes:
+      - ./tempo-data:/var/tempo
+
+  memcached:
+    image: memcached:1.6.38
+    container_name: memcached
+    ports:
+      - "11211:11211"
+    environment:
+      - MEMCACHED_MAX_MEMORY=64m # Set the maximum memory usage
+      - MEMCACHED_THREADS=4 # Number of threads to use
+
   tempo:
     image: grafana/tempo:latest
-    container_name: tempo
-    command: [ "-config.file=/etc/tempo.yaml" ]
+    command: ["-config.file=/etc/tempo.yaml"]
     volumes:
-      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
-      - tempo_data:/var/tempo
-    deploy:
-      resources:
-        limits:
-          memory: 400M
-    restart: unless-stopped
+      - ./tempo.yaml:/etc/tempo.yaml
+      - ./tempo-data:/var/tempo
     ports:
-      - "3200:3200"   # Tempo HTTP
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-    logging: *logging
+      - "14268:14268" # jaeger ingest
+      - "3200:3200" # tempo
+      - "9095:9095" # tempo grpc
+      - "4317:4317" # otlp grpc
+      - "4318:4318" # otlp http
+      - "9411:9411" # zipkin
+    depends_on:
+      - init
+      - memcached
 
   # Grafana Loki - Log aggregation system
   loki:
@@ -44,35 +64,18 @@ services:
       - "3100:3100"   # Loki HTTP
     logging: *logging
 
-  # Grafana Mimir - Prometheus-compatible metrics backend (CLI-only config)
-  mimir:
-    image: grafana/mimir:latest
-    container_name: mimir
+  prometheus:
+    image: prom/prometheus:latest
     command:
-      # - -config.file=/etc/mimir/mimir.yaml
-      - -server.http-listen-port=9009
-      - -server.grpc-listen-port=9095
-      - -distributor.ring.instance-addr=127.0.0.1
-      - -ingester.ring.instance-addr=127.0.0.1
-      - -store-gateway.sharding-ring.instance-addr=127.0.0.1
-      - -compactor.ring.instance-addr=127.0.0.1
-      - -ruler.ring.instance-addr=127.0.0.1
-      # - -query-scheduler.instance-addr=127.0.0.1
-      - -query-frontend.instance-addr=127.0.0.1
-      - -memberlist.join=127.0.0.1
-      - -blocks-storage.backend=filesystem
-      - -blocks-storage.filesystem.dir=/tmp/mimir/fs
-      - -blocks-storage.tsdb.dir=/tmp/mimir/tsdb
-      - -querier.max-concurrent=20
-    deploy:
-      resources:
-        limits:
-          memory: 300M
-    restart: unless-stopped
+      - --config.file=/etc/prometheus.yaml
+      - --web.enable-remote-write-receiver
+      - --web.enable-otlp-receiver
+      - --enable-feature=exemplar-storage
+      - --enable-feature=native-histograms
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus.yaml
     ports:
-      - "9009:9009"   # Mimir HTTP
-    logging: *logging
-
+      - "9090:9090"
   # Grafana - Visualization and observability platform
   grafana:
     image: grafana/grafana:latest
@@ -89,14 +92,18 @@ services:
     ports:
       - "3000:3000"   # Grafana UI
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor metricsSummary
+
     depends_on:
       loki:
         condition: service_started
       tempo:
         condition: service_started
-      mimir:
+      prometheus:
         condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
@@ -106,44 +113,7 @@ services:
       start_period: 30s
     logging: *logging
 
-  # OpenTelemetry Collector - Telemetry pipeline
-  otel-collector:
-    image: ${COLLECTOR_CONTRIB_IMAGE:-ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.136.0}
-    container_name: otel-collector
-    deploy:
-      resources:
-        limits:
-          memory: 200M
-    restart: unless-stopped
-    command: [ "--config=/etc/otelcol-config.yml", "--config=/etc/otelcol-config-extras.yml" ]
-    user: "0:0"
-    volumes:
-      - ${HOST_FILESYSTEM:-/}:/hostfs:ro
-      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
-      - ./otel-collector/otelcol-config.yml:/etc/otelcol-config.yml:ro
-      - ./otel-collector/otelcol-config-extras.yml:/etc/otelcol-config-extras.yml:ro
-    ports:
-      - "${OTEL_COLLECTOR_PORT_GRPC:-4317}:4317"   # OTLP gRPC
-      - "${OTEL_COLLECTOR_PORT_HTTP:-4318}:4318"   # OTLP HTTP
-    depends_on:
-      tempo:
-        condition: service_started
-      loki:
-        condition: service_started
-    logging: *logging
-    environment:
-      - OTEL_COLLECTOR_HOST=otel-collector
-      - OTEL_COLLECTOR_PORT_GRPC=${OTEL_COLLECTOR_PORT_GRPC:-4317}
-      - OTEL_COLLECTOR_PORT_HTTP=${OTEL_COLLECTOR_PORT_HTTP:-4318}
-      - GOMEMLIMIT=160MiB
-      - FRONTEND_PROXY_ADDR=localhost:8080
-      - IMAGE_PROVIDER_HOST=localhost
-      - IMAGE_PROVIDER_PORT=8081
-      - POSTGRES_HOST=localhost
-      - POSTGRES_PORT=5432
-      - POSTGRES_PASSWORD=postgres
-
-  # NetFlow to Traces Converter - Sends directly to Tempo
+  # NetFlow to Traces Converter - Sends telemetry directly to Tempo and Prometheus
   netflow2traces:
     build:
       context: ..
@@ -154,9 +124,11 @@ services:
       - NETFLOW_LISTEN_HOST=0.0.0.0
       - NETFLOW_LISTEN_PORT=2055
 
-      # OpenTelemetry configuration - sends directly to Tempo
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      # OpenTelemetry configuration - sends directly to Tempo (traces) and Prometheus (metrics)
+      - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc
+      - OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://prometheus:9090/api/v1/otlp/v1/metrics
+      - OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http
       - OTEL_SERVICE_NAME=netflow-to-traces
       - OTEL_SERVICE_VERSION=0.1.0
 
@@ -167,9 +139,24 @@ services:
     depends_on:
       tempo:
         condition: service_started
+      prometheus:
+        condition: service_started
     restart: unless-stopped
     logging: *logging
 
+  # NetFlow Generator - Continuous traffic generation for demos
+  # Sends NetFlow v5 packets with diverse traffic patterns
+  # To disable: docker-compose up -d --scale netflow-generator=0
+  netflow-generator:
+    image: networkstatic/nflow-generator
+    container_name: netflow-generator
+    command: ["-t", "netflow2traces", "-p", "2055"]
+    depends_on:
+      netflow2traces:
+        condition: service_started
+    restart: unless-stopped
+    logging: *logging
+    
 volumes:
   tempo_data:
   grafana_data:
@@ -181,19 +168,23 @@ networks:
     driver: bridge
 
 # Usage:
-#   docker-compose up -d                    # Start all services
-#   docker-compose logs -f netflow2traces   # View netflow2traces logs
-#   docker-compose down                     # Stop all services
-#   docker-compose down -v                  # Stop and remove volumes
+#   docker-compose up -d                              # Start all services (without generator)
+#   docker-compose --profile demo up -d               # Start with traffic generator
+#   docker-compose logs -f netflow2traces             # View netflow2traces logs
+#   docker-compose down                               # Stop all services
+#   docker-compose down -v                            # Stop and remove volumes
 #
 # Access services:
-#   Grafana UI:          http://localhost:3000 (admin/admin)
+#   Grafana UI:          http://localhost:3000
 #   Tempo API:           http://localhost:3200
+#   Tempo OTLP gRPC:     localhost:4317
+#   Tempo OTLP HTTP:     localhost:4318
 #   Loki API:            http://localhost:3100
-#   Mimir API:           http://localhost:9009
-#   OTEL Collector gRPC: localhost:4317
-#   OTEL Collector HTTP: localhost:4318
+#   Prometheus UI:       http://localhost:9090
+#   Prometheus OTLP:     http://localhost:9090/api/v1/otlp/v1/metrics
 #   NetFlow Listener:    localhost:2055 (UDP)
 #
 # Send test NetFlow data:
 #   python ../test_netflow_sender.py --host 127.0.0.1 --port 2055 --count 10
+#   python ../tools/netflow_generator.py --version 5 --pattern http --count 10
+#   python ../tools/netflow_generator.py --version 9 --pattern mixed --rate 2
